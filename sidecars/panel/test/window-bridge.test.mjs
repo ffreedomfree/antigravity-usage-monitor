@@ -45,7 +45,7 @@ import {
   isLoopbackBindHost,
   parseStandaloneCliArgs,
 } from '../backend/standalone-server.mjs';
-import { handleMcpJsonRpcMessage } from '../mcp-entry.mjs';
+import { handleMcpJsonRpcMessage, isOneShotCliParentCommand } from '../mcp-entry.mjs';
 import { computeCapsuleLayoutMode } from '../src/components/layout/WindowOverlayShell.js';
 import {
   getCacheToneClass,
@@ -7062,5 +7062,156 @@ test('WindowOverlayShell mirrors host --font-sans and --font-mono onto portalHos
     globalThis.ResizeObserver = prevRo;
     globalThis.MutationObserver = prevMo;
     globalThis.fetch = prevFetch;
+  }
+});
+
+test('isOneShotCliParentCommand detects one-shot agy print/sandbox invocations without blocking interactive CLI or Desktop hub', () => {
+  assert.equal(
+    isOneShotCliParentCommand(
+      'agy --model gemini-4-neon-medium --sandbox --disable-slash-commands --print-timeout 210s --output-format json -p hello'
+    ),
+    true
+  );
+  assert.equal(
+    isOneShotCliParentCommand('/usr/local/bin/agy --print "summarize diff"'),
+    true
+  );
+  assert.equal(
+    isOneShotCliParentCommand('"C:\\Program Files\\Antigravity\\antigravity-cli.exe" --output-format json -p test'),
+    true
+  );
+  assert.equal(isOneShotCliParentCommand('agy'), false);
+  assert.equal(isOneShotCliParentCommand('agy --model gemini-4-neon-high'), false);
+  assert.equal(isOneShotCliParentCommand('agy --hub --http-port 5387'), false);
+  assert.equal(isOneShotCliParentCommand('agy remote-control serve --sandbox'), false);
+  assert.equal(
+    isOneShotCliParentCommand('/Applications/Antigravity.app/Contents/Resources/bin/language_server --standalone --subclient_type hub'),
+    false
+  );
+  assert.equal(isOneShotCliParentCommand(''), false);
+});
+
+test('window-bridge stop({ disposeWindows: true }) preserves Desktop overlay when another lease leader or usage-monitor host is still alive', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-um-lease-dispose-'));
+  const agUserDataDir = path.join(tmpDir, 'Antigravity');
+  const leaseFilePath = path.join(tmpDir, 'window-bridge-lease.json');
+  fs.mkdirSync(agUserDataDir, { recursive: true });
+
+  let disposeCalls = 0;
+  let overlayAlive = false;
+  const cdpServer = http.createServer((req, res) => {
+    if (req.url === '/json/list') {
+      const addr = cdpServer.address();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify([
+          {
+            id: 'main-win',
+            type: 'page',
+            title: 'Antigravity',
+            url: 'https://127.0.0.1:51234/c/11111111-2222-3333-4444-555555555555',
+            webSocketDebuggerUrl: `ws://127.0.0.1:${addr.port}/devtools/page/main-win`,
+          },
+        ])
+      );
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise((resolve) => cdpServer.listen(0, '127.0.0.1', resolve));
+  const cdpPort = cdpServer.address().port;
+  fs.writeFileSync(path.join(agUserDataDir, 'DevToolsActivePort'), `${cdpPort}\n/devtools/browser/test\n`, 'utf8');
+
+  class FakeCdpWebSocket extends EventTarget {
+    constructor() {
+      super();
+      queueMicrotask(() => this.dispatchEvent(new Event('open')));
+    }
+    send(raw) {
+      const msg = JSON.parse(String(raw));
+      const expr = String(msg?.params?.expression || '');
+      let value = true;
+      if (expr.includes('delete window["__AGUsageMonitorOverlay"]')) {
+        disposeCalls += 1;
+        overlayAlive = false;
+      } else if (expr.includes('window["__AGUsageMonitorBridge"] =')) {
+        overlayAlive = true;
+      } else if (expr.includes('ensureAlive')) {
+        value = {
+          injected: overlayAlive,
+          alive: overlayAlive,
+          bundleVersion: 'v-test',
+          mountMode: 'dual',
+          dockKind: 'titlebar',
+        };
+      }
+      queueMicrotask(() => {
+        this.dispatchEvent(
+          new MessageEvent('message', {
+            data: JSON.stringify({ id: msg.id, result: { result: { value } } }),
+          })
+        );
+      });
+    }
+    close() {}
+  }
+
+  const makeController = ({ hasOtherHostAlive }) =>
+    createWindowBridgeController({
+      handleApiRequest: async () => ({ status: 200, contentType: 'application/json', body: '{}' }),
+      readAssetFn: (name) => (name === 'styles.css' ? '' : 'window.__AGUsageMonitorOverlay={ensureAlive:()=>true,dispose:()=>{}};'),
+      getSettingsFn: () => ({ enableWindowOverlay: true, windowMountMode: 'dual' }),
+      getBundleVersionFn: () => 'v-test',
+      bootBundleVersion: 'v-test',
+      env: { APPDATA: tmpDir, USAGE_MONITOR_HOST_PPID: '99999,88888' },
+      platform: 'win32',
+      homeDir: tmpDir,
+      leaseFilePath,
+      WebSocketImpl: FakeCdpWebSocket,
+      hasOtherHostAliveFn: () => hasOtherHostAlive,
+    });
+
+  try {
+    // Case 1: Secondary daemon holds lease, exits while Desktop host is still alive -> release lease, do NOT dispose Desktop window.
+    const ctrl1 = makeController({ hasOtherHostAlive: true });
+    await ctrl1.syncAllWindows();
+    assert.equal(overlayAlive, true);
+    const leaseBeforeStop = JSON.parse(fs.readFileSync(leaseFilePath, 'utf8'));
+    assert.equal(leaseBeforeStop.pid, process.pid);
+
+    await ctrl1.stop({ disposeWindows: true });
+    assert.equal(disposeCalls, 0, 'Must not dispose Desktop overlay while another usage-monitor host is alive');
+    assert.equal(overlayAlive, true);
+    const leaseAfterStop = JSON.parse(fs.readFileSync(leaseFilePath, 'utf8'));
+    assert.equal(leaseAfterStop.pid, 0, 'Exiting leader releases lease immediately for smooth takeover');
+
+    // Case 2: Another live PID already owns the lease -> exiting follower must not dispose Desktop window.
+    const ctrl2 = makeController({ hasOtherHostAlive: false });
+    await ctrl2.syncAllWindows();
+    fs.writeFileSync(
+      leaseFilePath,
+      JSON.stringify({ pid: process.ppid || 1, bundleVersion: 'v-test', updatedAtMs: Date.now() }),
+      'utf8'
+    );
+    await ctrl2.stop({ disposeWindows: true });
+    assert.equal(disposeCalls, 0, 'Must not dispose Desktop overlay when another live leader holds the lease');
+    assert.equal(overlayAlive, true);
+
+    // Case 3: No other host is alive (plugin disabled / Desktop shutting down) -> cleanly disposes Desktop window.
+    fs.writeFileSync(
+      leaseFilePath,
+      JSON.stringify({ pid: process.pid, bundleVersion: 'v-test', updatedAtMs: Date.now() }),
+      'utf8'
+    );
+    const ctrl3 = makeController({ hasOtherHostAlive: false });
+    await ctrl3.syncAllWindows();
+    await ctrl3.stop({ disposeWindows: true });
+    assert.equal(disposeCalls, 1, 'Disposes overlay cleanly when no other usage-monitor host remains');
+    assert.equal(overlayAlive, false);
+  } finally {
+    await new Promise((resolve) => cdpServer.close(resolve));
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });

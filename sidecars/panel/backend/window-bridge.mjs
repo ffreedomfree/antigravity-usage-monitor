@@ -10,6 +10,7 @@
  * 3. 完全不触碰宿主 `app.asar` 文件，客户端升级或无调试端口时静默回退至右侧辅助栏。
  */
 
+import { execFileSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -1159,6 +1160,7 @@ export function createWindowBridgeController(options) {
     cloudCodeProxy = null,
     manageCloudCodeProxy = false,
     resolveLocalContextRulesFn = null,
+    hasOtherHostAliveFn = null,
     getHostI18nDescriptorFn =
       options?.env === undefined && options?.homeDir === undefined
         ? getHostI18nBridgeDescriptor
@@ -2871,6 +2873,78 @@ export function createWindowBridgeController(options) {
     initialTimer.unref?.();
   }
 
+  function isUsageMonitorHostCommand(cmd) {
+    const s = String(cmd || '');
+    return (
+      (s.includes('sidecar_sdk') && s.includes('main.mjs')) ||
+      (s.includes('usage-monitor') && s.includes('bridge-daemon.mjs'))
+    );
+  }
+
+  function detectOtherUsageMonitorHostAlive() {
+    if (typeof hasOtherHostAliveFn === 'function') {
+      try {
+        return Boolean(hasOtherHostAliveFn());
+      } catch {
+        return false;
+      }
+    }
+    try {
+      if (platform === 'linux' && existsSync('/proc')) {
+        for (const entry of readdirSync('/proc')) {
+          if (!/^\d+$/.test(entry)) continue;
+          const pid = Number(entry);
+          if (pid === process.pid) continue;
+          try {
+            const cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0+/g, ' ');
+            if (isUsageMonitorHostCommand(cmd)) return true;
+          } catch {
+            // 忽略退出中的瞬态进程
+          }
+        }
+        return false;
+      }
+      if (platform === 'win32') {
+        const raw = execFileSync(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            "Get-CimInstance Win32_Process -Filter \"Name LIKE 'node%' OR Name LIKE 'Antigravity%'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+          ],
+          {
+            encoding: 'utf8',
+            timeout: 1500,
+            windowsHide: true,
+            stdio: ['ignore', 'pipe', 'ignore'],
+          }
+        ).trim();
+        if (!raw) return false;
+        const parsed = JSON.parse(raw);
+        const list = Array.isArray(parsed) ? parsed : [parsed];
+        return list.some(
+          (item) => Number(item?.ProcessId) !== process.pid && isUsageMonitorHostCommand(item?.CommandLine)
+        );
+      }
+      const psOut = execFileSync('ps', ['-ax', '-o', 'pid=,command='], {
+        encoding: 'utf8',
+        timeout: 500,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      return String(psOut || '')
+        .split(/\r?\n/)
+        .some((line) => {
+          const m = line.trim().match(/^(\d+)\s+(.+)$/);
+          if (!m) return false;
+          const pid = Number(m[1]);
+          return pid !== process.pid && isUsageMonitorHostCommand(m[2]);
+        });
+    } catch {
+      return false;
+    }
+  }
+
   async function stop({ disposeWindows = false } = {}) {
     if (initialTimer) {
       clearTimeout(initialTimer);
@@ -2880,10 +2954,27 @@ export function createWindowBridgeController(options) {
       clearTimeout(pollTimer);
       pollTimer = null;
     }
-    if (
+    let shouldDisposeWindows = Boolean(
       disposeWindows &&
-      (hadInjectedTargets || hadInjectedChatFrames || hadContextWindows || hadHostI18n)
-    ) {
+        (hadInjectedTargets || hadInjectedChatFrames || hadContextWindows || hadHostI18n)
+    );
+    if (shouldDisposeWindows && leaseFilePath) {
+      const currentLease = loadJson(leaseFilePath, null);
+      const leasePid = Number(currentLease?.pid || 0);
+      if (leasePid > 0 && leasePid !== process.pid && isPidAlive(leasePid)) {
+        shouldDisposeWindows = false;
+      } else if (leasePid === process.pid) {
+        try {
+          saveJson(leaseFilePath, { ...currentLease, pid: 0, updatedAtMs: 0 });
+        } catch {
+          // 忽略租约释放失败
+        }
+        if (env?.USAGE_MONITOR_HOST_PPID && detectOtherUsageMonitorHostAlive()) {
+          shouldDisposeWindows = false;
+        }
+      }
+    }
+    if (shouldDisposeWindows) {
       const prevStopped = stopped;
       stopped = false;
       try {

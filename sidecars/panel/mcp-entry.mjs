@@ -10,7 +10,7 @@
  *    本进程立即通知 `bridge-daemon.mjs` 卸载窗口顶栏组件并干净退出。
  */
 
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -108,8 +108,65 @@ export function handleMcpJsonRpcMessage(msg, serverVersion = '1.4.4') {
   };
 }
 
+/**
+ * 判断父进程命令行是否属于一次性无头 `agy` CLI 调用（如 `agy -p ... --output-format json`）。
+ * 此类短命 CLI 子进程无需派生独立的 `bridge-daemon.mjs`，避免争抢桌面端顶栏租约或在退出时卸载桌面胶囊。
+ *
+ * @param {string} cmdLine
+ * @returns {boolean}
+ */
+export function isOneShotCliParentCommand(cmdLine) {
+  const cmd = String(cmdLine || '').trim();
+  if (!cmd) return false;
+  const isAgyCli = /(?:^|[\s/\\"'])(?:agy|antigravity-cli)(?:\.exe)?(?:["'\s]|$)/i.test(cmd);
+  if (!isAgyCli) return false;
+  if (/(?:--hub\b|\bremote-control\b)/i.test(cmd)) return false;
+  return /(?:^|\s)(?:-p\b|--print\b|--print-timeout\b|--output-format\b|--sandbox\b|--disable-slash-commands\b)/.test(
+    cmd
+  );
+}
+
+function readParentProcessCommandLine(ppid, platform = process.platform) {
+  const pid = Number(ppid);
+  if (!Number.isInteger(pid) || pid <= 1) return '';
+  try {
+    if (platform === 'linux' && existsSync(`/proc/${pid}/cmdline`)) {
+      return readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0+/g, ' ').trim();
+    }
+    if (platform === 'win32') {
+      return execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`,
+        ],
+        {
+          encoding: 'utf8',
+          timeout: 1500,
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        }
+      ).trim();
+    }
+    return execFileSync('ps', ['-o', 'command=', '-p', String(pid)], {
+      encoding: 'utf8',
+      timeout: 500,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return '';
+  }
+}
+
+function shouldSkipDaemonForParentProcess(ppid = process.ppid, platform = process.platform) {
+  return isOneShotCliParentCommand(readParentProcessCommandLine(ppid, platform));
+}
+
 function startMcpHostSupervisor() {
   const serverVersion = readMcpServerVersion();
+  const skipDaemon = shouldSkipDaemonForParentProcess(process.ppid, process.platform);
   let shuttingDown = false;
   let daemonChild = null;
   let respawnTimer = null;
@@ -290,7 +347,9 @@ function startMcpHostSupervisor() {
   process.on('SIGINT', shutdownSupervisor);
   process.stdin.resume();
 
-  spawnDaemon();
+  if (!skipDaemon) {
+    spawnDaemon();
+  }
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : '';
